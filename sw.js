@@ -1,5 +1,5 @@
 /* Кто кому — service worker: офлайн-оболочка (stale-while-revalidate) */
-const CACHE = 'kto-komu-v1';
+const CACHE = 'kto-komu-v2';
 const ASSETS = [
   './',
   './index.html',

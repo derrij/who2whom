@@ -45,7 +45,8 @@ function loadApp() {
 globalThis.__T = {
   compute, todayISO, daysBetween, addDays, parseNum, round2, money, uid,
   totals, viewList, viewDetail, viewForm, viewSettings, routeHTML, render,
-  saveDebt, savePayment, handleAction, formValues, findDebt, exportJSON,
+  saveDebt, savePayment, handleAction, setMethod, formValues, findDebt, exportJSON,
+  migrateSettings, effectiveRate, dayDenominator, periodEnds, monthLabel, isLeapYear,
   get data() { return data; },
   get settings() { return settings; },
   setData(d) { data = d; },

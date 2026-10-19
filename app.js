@@ -54,10 +54,42 @@ const store = {
 
 let canStore = store.set('kto-komu:probe', '1');
 
+/* ---------- способ расчёта процентов ---------- */
+const BASE_LABELS = {
+  act365: 'база 365',
+  actact: 'база «365 или 366»',
+  act360: 'база 360',
+};
+const COMPOUND_LABELS = {
+  monthly: 'зачисление раз в месяц',
+  yearly: 'зачисление раз в год',
+  none: 'без капитализации',
+  daily: 'капитализация ежедневно',
+};
+/* значения по умолчанию — как у накопительного счёта в банке еврозоны */
+const METHOD_PRESETS = [
+  { key: 'eur-monthly', title: 'EUR-банк: раз в месяц', base: 'act365', compounding: 'monthly' },
+  { key: 'eur-yearly', title: 'EUR-банк: раз в год', base: 'act365', compounding: 'yearly' },
+  { key: 'simple-365', title: 'Простые проценты, 365', base: 'act365', compounding: 'none' },
+  { key: 'ru-deposit', title: 'Вклад 365/366', base: 'actact', compounding: 'none' },
+  { key: 'daily', title: 'Капитализация ежедневно', base: 'act365', compounding: 'daily' },
+  { key: 'loans-360', title: 'Кредит, база 360', base: 'act360', compounding: 'none' },
+];
+
 let data = { debts: [] };
-let settings = { compound: true };
+let settings = { base: 'act365', compounding: 'monthly' };
 let filter = 'all';
 let deferredPrompt = null;
+
+/* настройки из старых версий: было поле compound (да/нет) */
+function migrateSettings(s) {
+  const out = Object.assign({ base: 'act365', compounding: 'monthly' }, s || {});
+  if (s && typeof s.compound === 'boolean' && s.compounding === undefined) {
+    out.compounding = s.compound ? 'daily' : 'none';
+  }
+  delete out.compound;
+  return out;
+}
 
 function load() {
   try {
@@ -66,7 +98,7 @@ function load() {
   } catch (e) { console.warn('данные не прочитаны', e); }
   try {
     const s = JSON.parse(store.get(KEY_SET) || 'null');
-    if (s && typeof s === 'object') settings = Object.assign(settings, s);
+    if (s && typeof s === 'object') settings = migrateSettings(s);
   } catch (e) { /* ignore */ }
 }
 function save() {
@@ -81,22 +113,67 @@ function formValues(form) {
   return out;
 }
 
+/* ---------- календарь и базы дней ---------- */
+const MONTH_FMT = new Intl.DateTimeFormat('ru-RU', { month: 'short', year: 'numeric' });
+const monthLabel = (key) => {
+  const [y, m] = key.split('-').map(Number);
+  return MONTH_FMT.format(new Date(Date.UTC(y, m - 1, 1)));
+};
+const isLeapYear = (y) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+const yearOfDay = (d) => new Date(d * 86400000).getUTCFullYear();
+const monthKey = (d) => ymdFromDay(d).slice(0, 7);
+
+/* знаменатель дневной ставки: 365, 360 или 366 в високосном году */
+function dayDenominator(day, base) {
+  if (base === 'act360') return 360;
+  if (base === 'actact') return isLeapYear(yearOfDay(day)) ? 366 : 365;
+  return 365;
+}
+
+/* дни, когда проценты зачисляются в тело долга */
+function periodEnds(fromDay, toDay, compounding) {
+  const set = new Set();
+  if (compounding !== 'monthly' && compounding !== 'yearly') return set;
+  let y = yearOfDay(fromDay);
+  let m = new Date(fromDay * 86400000).getUTCMonth();
+  while (true) {
+    const last = compounding === 'yearly'
+      ? Date.UTC(y, 11, 31) / 86400000
+      : Date.UTC(y, m + 1, 0) / 86400000; // последний день месяца
+    if (last > toDay) break;
+    if (last >= fromDay) set.add(last);
+    if (compounding === 'yearly') y++;
+    else { m++; if (m > 11) { m = 0; y++; } }
+  }
+  return set;
+}
+
 /* ---------- расчёт долга ----------
    direction: 'lent'  — я дал в долг (мне должны)
               'borrowed' — я взял в долг (я должен)
-   balance = остаток тела долга + неоплаченные начисленные проценты
+
+   Проценты начисляются за каждый день на остаток (база 365/360/365-366),
+   а зачисляются в тело долга в зависимости от способа:
+     monthly — в последний день месяца, с округлением до копеек (банковская схема)
+     yearly  — 31 декабря, с округлением до копеек
+     daily   — каждый день (капитализация непрерывная)
+     none    — не зачисляются, копятся отдельно (простые проценты)
+
+   balance = тело долга + начисленное, но ещё не зачисленное
 ------------------------------------------------- */
-function compute(debt, asOfStr = todayISO(), compound = settings.compound) {
+function compute(debt, asOfStr = todayISO(), opt = settings) {
+  const base = opt.base || 'act365';
+  const compounding = opt.compounding || 'none';
   const start = debt.startDate || asOfStr;
-  const asOf = asOfStr;
-  const end = debt.endDate && debt.endDate < asOf ? debt.endDate : asOf;
+  const end = debt.endDate && debt.endDate < asOfStr ? debt.endDate : asOfStr;
   const startDay = dayNum(start);
   const n = Math.max(0, daysBetween(start, end));
-  const dailyRate = Math.max(0, Number(debt.rate) || 0) / 100 / 365;
+  const rate = Math.max(0, Number(debt.rate) || 0) / 100;
 
   let principal = Number(debt.principal) || 0;
-  let accrued = 0;
-  let paid = 0;
+  let accrued = 0;   // начислено, но ещё не зачислено в тело долга
+  let credited = 0;  // зачислено процентами за всё время
+  let paid = 0;      // оплачено всего
 
   const apply = (amount) => {
     let rem = amount;
@@ -113,27 +190,75 @@ function compute(debt, asOfStr = todayISO(), compound = settings.compound) {
   }
   for (const [k, amt] of byDay) if (k <= startDay) { apply(amt); byDay.delete(k); }
 
+  const ends = periodEnds(startDay, startDay + n, compounding);
+  const rows = [];
+  let row = null;
+
   for (let k = 1; k <= n; k++) {
-    if (dailyRate > 0) {
-      const base = compound ? principal + accrued : principal;
-      if (base > 0) accrued += base * dailyRate;
+    const d = startDay + k;
+
+    const key = monthKey(d);
+    if (!row || row.key !== key) {
+      if (row) row.balanceEnd = principal + accrued;
+      row = { key, days: 0, accrued: 0, credited: 0, payments: 0, balanceEnd: 0, pending: false };
+      rows.push(row);
     }
-    const pay = byDay.get(startDay + k);
-    if (pay) apply(pay);
+    row.days++;
+
+    if (rate > 0) {
+      const basis = compounding === 'daily' ? principal + accrued : principal;
+      if (basis > 0) {
+        const dayInterest = basis * rate / dayDenominator(d, base);
+        accrued += dayInterest;
+        row.accrued += dayInterest;
+      }
+    }
+
+    const pay = byDay.get(d);
+    if (pay) { apply(pay); row.payments += pay; }
+
+    if (ends.has(d)) {
+      const toCredit = round2(accrued);
+      if (toCredit !== 0) {
+        principal += toCredit;
+        credited += toCredit;
+        accrued -= toCredit;
+        row.credited = toCredit;
+      }
+      row.pending = false;
+    }
   }
 
-  const balance = principal + accrued;
+  if (row) {
+    row.balanceEnd = principal + accrued;
+    if (row.accrued > 0 && !ends.has(startDay + n)) row.pending = true;
+  }
+
   return {
-    balance,
+    balance: principal + accrued,
     principal,
     accrued,
+    credited,
+    interest: credited + accrued, // всего начислено процентов за время долга
     paid,
     days: n,
     start,
     end: debt.endDate || null,
-    dailyRate,
+    rows,
+    base,
+    compounding,
     closed: !!debt.endDate,
   };
+}
+
+/* эффективная годовая ставка для текущего способа расчёта (сравнить со ставкой банка) */
+function effectiveRate(debt, opt = settings) {
+  const r = Number(debt.rate) || 0;
+  if (!(r > 0)) return 0;
+  const start = debt.startDate || todayISO();
+  const probe = { principal: 1000, rate: r, startDate: start, payments: [], endDate: null };
+  const res = compute(probe, addDays(start, 365), opt);
+  return (res.balance / 1000 - 1) * 100;
 }
 
 /* обороты по всем долгам */
@@ -216,7 +341,7 @@ function card(d, r) {
   const bal = Math.abs(r.balance) < 0.005 ? 0 : r.balance;
   const metaText = [
     `тело ${money(r.principal)}`,
-    r.accrued > 0.005 ? `проценты ${money(r.accrued)}` : null,
+    r.interest > 0.005 ? `проценты ${money(r.interest)}` : null,
     d.rate > 0 ? `${numFmt.format(d.rate)} % годовых` : null,
     `${r.days} ${plural(r.days, 'день', 'дня', 'дней')}`,
   ].filter(Boolean).join(' · ');
@@ -240,6 +365,25 @@ function viewDetail(d) {
   const lent = d.direction === 'lent';
   const bal = Math.abs(r.balance) < 0.005 ? 0 : r.balance;
   const over = r.balance < -0.005;
+  const eff = d.rate > 0 ? effectiveRate(d) : 0;
+  const methodText = `${BASE_LABELS[r.base]} · ${COMPOUND_LABELS[r.compounding]}`;
+  const showCredited = r.compounding === 'monthly' || r.compounding === 'yearly';
+  const monthsTable = !r.rows.length ? '' : `
+    <table class="months">
+      <thead>
+        <tr><th>Месяц</th><th>Дней</th><th>Начислено</th>${showCredited ? '<th>Зачислено</th>' : ''}<th>Остаток</th></tr>
+      </thead>
+      <tbody>
+        ${r.rows.map((row) => `<tr>
+          <td>${esc(monthLabel(row.key))}</td>
+          <td class="num">${row.days}</td>
+          <td class="num">${money(row.accrued)}</td>
+          ${showCredited ? `<td class="num">${row.credited ? money(row.credited) : (row.pending ? '<span class="muted">ожидает</span>' : '<span class="muted">—</span>')}</td>` : ''}
+          <td class="num">${money(row.balanceEnd)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    ${showCredited && r.accrued > 0.005 ? '<div class="hint">«Начислено» — проценты за месяц, «зачислено» — сколько из них уже прибавлено к телу долга. Последняя строка может быть неполной: месяц ещё не закончился.</div>' : ''}`;
 
   const pays = (d.payments || []).slice().sort((a, b) => dayNum(b.date) - dayNum(a.date));
   const payList = pays.length
@@ -272,20 +416,23 @@ function viewDetail(d) {
     <h2>Расчёт</h2>
     <div class="rows">
       <div class="row"><span class="k">Остаток тела долга</span><span class="v">${money(r.principal)}</span></div>
-      <div class="row"><span class="k">Начисленные проценты</span><span class="v">${money(r.accrued)}</span></div>
+      <div class="row"><span class="k">Начислено, ещё не зачислено</span><span class="v">${money(r.accrued)}</span></div>
+      <div class="row"><span class="k">Зачислено процентами за всё время</span><span class="v">${money(r.credited)}</span></div>
       <div class="row"><span class="k">Оплачено всего</span><span class="v">${money(r.paid)}</span></div>
       <div class="row total"><span class="k">К возврату</span><span class="v">${money(r.balance)}</span></div>
     </div>
     <div class="spacer"></div>
     <div class="rows">
-      <div class="row"><span class="k">Ставка</span><span class="v">${numFmt.format(d.rate || 0)} % годовых${
-        d.rate > 0 ? ` <span class="muted small">(${(d.rate / 365).toFixed(4)} %/день)</span>` : ''}</span></div>
+      <div class="row"><span class="k">Ставка</span><span class="v">${numFmt.format(d.rate || 0)} % годовых</span></div>
+      <div class="row"><span class="k">Способ расчёта</span><span class="v">${esc(methodText)}</span></div>
+      ${eff > 0 ? `<div class="row"><span class="k">Эффективная ставка</span><span class="v">≈ ${numFmt.format(eff)} % <span class="muted small">за 365 дней</span></span></div>` : ''}
       <div class="row"><span class="k">Период</span><span class="v">${esc(ruDate(r.start))} → ${esc(ruDate(r.end || todayISO()))}</span></div>
       <div class="row"><span class="k">Дней начисления</span><span class="v">${r.days}</span></div>
-      <div class="row"><span class="k">Капитализация</span><span class="v">${settings.compound ? 'да' : 'нет'}</span></div>
       ${d.note ? `<div class="row"><span class="k">Заметка</span><span class="v">${esc(d.note)}</span></div>` : ''}
     </div>
   </div>
+
+  ${monthsTable ? `<div class="card"><h2>Начисления по месяцам</h2>${monthsTable}</div>` : ''}
 
   <div class="card">
     <h2>Оплаты</h2>
@@ -354,7 +501,7 @@ function viewForm(d) {
       <div class="field">
         <label>Ставка, % годовых</label>
         <input name="rate" type="text" inputmode="decimal" value="${esc(String(v.rate ?? 0))}" placeholder="0">
-        <div class="hint">Проценты идут на остаток: ставка ÷ 365 за каждый день, начиная со дня, следующего за датой выдачи.</div>
+        <div class="hint">Проценты идут на остаток за каждый день использования. Способ расчёта общий для всех долгов, меняется в настройках: сейчас ${esc(BASE_LABELS[settings.base])}, ${esc(COMPOUND_LABELS[settings.compounding])}.</div>
       </div>
       <div class="field">
         <label>Дата выдачи</label>
@@ -370,16 +517,50 @@ function viewForm(d) {
 }
 
 function viewSettings() {
+  const opt = (value, label, current) =>
+    `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
+
+  const demo = compute({ principal: 1000, rate: 12, startDate: '2026-01-01', payments: [] }, '2027-01-01');
+  const demoEff = effectiveRate({ rate: 12, startDate: '2026-01-01' });
+
+  const presets = METHOD_PRESETS.map((p) => {
+    const active = p.base === settings.base && p.compounding === settings.compounding;
+    return `<button class="chip-btn${active ? ' active' : ''}" data-act="preset" data-base="${p.base}" data-comp="${p.compounding}">${p.title}</button>`;
+  }).join('');
+
   return `
   <button class="btn block back" data-act="back">← Назад</button>
   ${bannerNoStorage()}
   <div class="card">
-    <h2>Проценты</h2>
-    <div class="row" style="border:0;padding:0">
-      <span class="k" style="max-width:75%">Капитализация: начисленные проценты прибавляются к остатку, и на них тоже идут проценты</span>
-      <button class="mini" data-act="toggle-compound">${settings.compound ? 'включена' : 'выключена'}</button>
+    <h2>Способ расчёта процентов</h2>
+    <p class="small muted">Один способ для всех долгов — как в договоре банка.</p>
+    <div class="presets">${presets}</div>
+
+    <div class="field">
+      <label>База дней в году</label>
+      <select id="setBase">
+        ${opt('act365', '365 — фактических дней / 365 (банки в еврозоне)', settings.base)}
+        ${opt('actact', '365 или 366 — високосный год делится на 366 (вклады в РФ)', settings.base)}
+        ${opt('act360', '360 — как по кредитам и овердрафтам', settings.base)}
+      </select>
     </div>
-    <div class="hint">Выключено — проценты считаются простые, только на тело долга.</div>
+
+    <div class="field">
+      <label>Когда проценты зачисляются в тело долга</label>
+      <select id="setCompounding">
+        ${opt('monthly', 'Раз в месяц, с капитализацией (обычная схема накопительного счёта)', settings.compounding)}
+        ${opt('yearly', 'Раз в год, с капитализацией', settings.compounding)}
+        ${opt('none', 'Не зачисляются — копятся отдельно (простые проценты)', settings.compounding)}
+        ${opt('daily', 'Каждый день, с капитализацией', settings.compounding)}
+      </select>
+    </div>
+
+    <div class="rows">
+      <div class="row"><span class="k">Выбрано</span><span class="v">${esc(BASE_LABELS[settings.base])} · ${esc(COMPOUND_LABELS[settings.compounding])}</span></div>
+      <div class="row"><span class="k">Пример: 1000 € под 12 % за 365 дней</span><span class="v">${money(demo.balance)}</span></div>
+      <div class="row"><span class="k">Эффективная ставка</span><span class="v">${numFmt.format(demoEff)} % годовых</span></div>
+    </div>
+    <div class="hint">Проценты начисляются за каждый день на остаток, начиная со дня, следующего за датой выдачи, по день возврата включительно. При зачислении раз в месяц или в год сумма округляется до копеек — так же, как в выписке банка.</div>
   </div>
 
   <div class="card">
@@ -403,7 +584,8 @@ function viewSettings() {
   <div class="card">
     <h2>О программе</h2>
     <div class="rows">
-      <div class="row"><span class="k">Версия</span><span class="v">1.0</span></div>
+      <div class="row"><span class="k">Версия</span><span class="v">1.1</span></div>
+      <div class="row"><span class="k">Способ расчёта</span><span class="v">${esc(BASE_LABELS[settings.base])} · ${esc(COMPOUND_LABELS[settings.compounding])}</span></div>
       <div class="row"><span class="k">Долгов в базе</span><span class="v">${data.debts.length}</span></div>
       <div class="row"><span class="k">Открытых</span><span class="v">${data.debts.filter((d) => !d.endDate).length}</span></div>
     </div>
@@ -477,7 +659,7 @@ function savePayment(form) {
 
 /* ---------- экспорт / импорт ---------- */
 function exportJSON() {
-  const payload = { app: 'kto-komu', version: 1, exportedAt: new Date().toISOString(), settings, debts: data.debts };
+  const payload = { app: 'kto-komu', version: 2, exportedAt: new Date().toISOString(), settings, debts: data.debts };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -515,7 +697,7 @@ function importJSON(file) {
         const idx = data.debts.findIndex((d) => d.id === item.id);
         if (idx >= 0) { data.debts[idx] = item; updated++; } else { data.debts.push(item); added++; }
       }
-      if (obj.settings) settings = Object.assign(settings, obj.settings);
+      if (obj.settings) settings = migrateSettings(Object.assign({}, settings, obj.settings));
       save();
       render();
       alert(`Импорт готов: добавлено ${added}, обновлено ${updated}.`);
@@ -542,6 +724,13 @@ async function doInstall() {
 }
 
 /* ---------- события ---------- */
+function setMethod(patch) {
+  if (patch.base) settings.base = patch.base;
+  if (patch.compounding) settings.compounding = patch.compounding;
+  save();
+  render();
+}
+
 function handleAction(el) {
   const act = el.dataset.act;
   const id = el.dataset.id;
@@ -603,10 +792,8 @@ function handleAction(el) {
       render(true);
       break;
     }
-    case 'toggle-compound':
-      settings.compound = !settings.compound;
-      save();
-      render();
+    case 'preset':
+      setMethod({ base: el.dataset.base, compounding: el.dataset.comp });
       break;
     case 'export':
       exportJSON();
@@ -639,10 +826,13 @@ document.addEventListener('submit', (e) => {
 });
 
 document.addEventListener('change', (e) => {
-  if (e.target.id === 'importFile') {
-    importJSON(e.target.files && e.target.files[0]);
-    e.target.value = '';
+  const t = e.target;
+  if (t.id === 'importFile') {
+    importJSON(t.files && t.files[0]);
+    t.value = '';
   }
+  if (t.id === 'setBase') setMethod({ base: t.value });
+  if (t.id === 'setCompounding') setMethod({ compounding: t.value });
 });
 
 window.addEventListener('hashchange', () => render(true));

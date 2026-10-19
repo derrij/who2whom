@@ -40,6 +40,12 @@ has(detail, 'тело', 'детали долга: остаток тела');
 has(detail, 'Иван', 'детали долга: имя');
 has(detail, 'Погасить полностью', 'детали долга: закрытие');
 has(detail, 'перевод', 'детали долга: оплата в списке');
+has(detail, 'Зачислено процентами', 'детали долга: зачисленные проценты');
+has(detail, 'Начислено, ещё не зачислено', 'детали долга: незачисленные проценты');
+has(detail, 'Способ расчёта', 'детали долга: способ расчёта');
+has(detail, 'Эффективная ставка', 'детали долга: эффективная ставка');
+has(detail, 'Начисления по месяцам', 'детали долга: разбивка по месяцам');
+has(detail, 'март 2026 г.', 'детали долга: строки месяцев');
 
 const closedDebt = { ...T.data.debts[0], endDate: '2026-04-01' };
 has(T.viewDetail(closedDebt), 'Открыть заново', 'закрытый долг: можно открыть заново');
@@ -48,7 +54,9 @@ has(T.viewDetail(closedDebt), 'закрыт', 'закрытый долг: пом
 has(T.viewForm(null), 'Новый долг', 'форма нового долга');
 has(T.viewForm(T.data.debts[1]), 'Изменить долг', 'форма редактирования');
 has(T.viewForm(T.data.debts[1]), 'borrowed', 'форма: направление подставлено');
-has(T.viewSettings(), 'Капитализация', 'настройки');
+has(T.viewSettings(), 'Способ расчёта процентов', 'настройки');
+has(T.viewSettings(), 'EUR-банк: раз в месяц', 'настройки: пресет банка');
+has(T.viewSettings(), 'Пример: 1000', 'настройки: пример расчёта');
 has(T.viewSettings(), 'Скачать копию', 'настройки: экспорт');
 
 /* маршруты */
@@ -56,7 +64,7 @@ T.setData({ debts: JSON.parse(JSON.stringify(seed)) });
 const route = (hash) => { global.location.hash = hash; return T.routeHTML(); };
 has(route('#/'), 'Сальдо', 'маршрут: список');
 has(route('#/new'), 'Новый долг', 'маршрут: новый долг');
-has(route('#/settings'), 'Капитализация', 'маршрут: настройки');
+has(route('#/settings'), 'Способ расчёта', 'маршрут: настройки');
 has(route('#/debt/a1'), 'Расчёт', 'маршрут: детали');
 has(route('#/debt/a1/edit'), 'Изменить долг', 'маршрут: редактирование');
 has(route('#/debt/нет-такого'), 'Сальдо', 'маршрут: неизвестный id → список');
@@ -129,11 +137,33 @@ ok(debt.payments.every((p) => p.id !== payId), 'оплата удалена');
 T.handleAction(makeEl('del', { id: debt.id }));
 ok(T.data.debts.length === 0, 'долг удалён');
 
-/* ---------- настройки: капитализация ---------- */
-const before = T.settings.compound;
-T.handleAction(makeEl('toggle-compound'));
-ok(T.settings.compound === !before, 'переключатель капитализации');
-T.handleAction(makeEl('toggle-compound'));
+/* ---------- настройки: способ расчёта ---------- */
+ok(T.settings.base === 'act365' && T.settings.compounding === 'monthly', 'по умолчанию банковский метод');
+T.handleAction(makeEl('preset', { base: 'actact', comp: 'none' }));
+ok(T.settings.base === 'actact' && T.settings.compounding === 'none', 'пресет применяется');
+ok(JSON.parse(T.storage().get('kto-komu:settings:v1')).base === 'actact', 'способ расчёта сохраняется в хранилище');
+has(T.viewSettings(), 'Вклад 365/366', 'настройки: активный пресет отмечен');
+
+T.setMethod({ compounding: 'daily' });
+ok(T.settings.base === 'actact' && T.settings.compounding === 'daily', 'setMethod меняет только переданное поле');
+T.setMethod({ base: 'act365', compounding: 'monthly' });
+
+/* чем чаще капитализация, тем больше итог */
+T.setData({ debts: [{
+  id: 'x', counterparty: 'Тест', direction: 'lent', principal: 1000, rate: 12,
+  startDate: '2026-01-01', payments: [], endDate: null, note: '',
+}] });
+const sumWith = (compounding) => { T.setMethod({ base: 'act365', compounding }); return T.totals().cache.get('x').balance; };
+const mSimple = sumWith('none');
+const mMonthly = sumWith('monthly');
+const mDaily = sumWith('daily');
+ok(mSimple < mMonthly && mMonthly < mDaily,
+  `чаще зачисление — больше итог: простые ${mSimple.toFixed(2)} < месячные ${mMonthly.toFixed(2)} < ежедневные ${mDaily.toFixed(2)}`);
+/* разница ежедневной и простой капитализации сверяется с формулой сложного процента */
+const elapsed = T.daysBetween('2026-01-01', T.todayISO());
+const expectDiff = 1000 * (Math.pow(1 + 0.12 / 365, elapsed) - 1) - 1000 * 0.12 * elapsed / 365;
+ok(Math.abs((mDaily - mSimple) - expectDiff) < 0.02, `разница за ${elapsed} дн. совпадает с формулой (${expectDiff.toFixed(2)} €)`);
+T.setMethod({ base: 'act365', compounding: 'monthly' });
 
 /* ---------- экспорт не падает ---------- */
 let threw = null;
